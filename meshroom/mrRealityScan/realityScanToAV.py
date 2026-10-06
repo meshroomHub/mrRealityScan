@@ -1,7 +1,6 @@
 __version__ = "0.1"
 
 import os
-import json
 
 from meshroom.core import desc
 from meshroom.core.utils import VERBOSE_LEVEL
@@ -83,6 +82,8 @@ class RealityScanToSfMData(desc.Node):
         import xml.etree.ElementTree as ET
         from PIL import Image
         import logging
+        import numpy as np
+        from pyalicevision import sfmData, sfmDataIO, camera, geometry
 
         logging.getLogger().setLevel(node.verboseLevel.value.upper())
 
@@ -94,19 +95,10 @@ class RealityScanToSfMData(desc.Node):
         if not os.path.exists(xmp_folder) or not os.path.exists(images_folder):
             raise ValueError("The XMP and Images folders must exist.")
 
-        sfm_data = {
-            "version": ["1", "2", "2"],
-            "featuresFolders": [],
-            "matchesFolders": [],
-            "views": [],
-            "intrinsics": [],
-            "poses": []
-        }
+        data = sfmData.SfMData()
 
         intrinsics_map = {}
-        view_id_counter = 10000000
-        pose_id_counter = 20000000
-        intrinsic_id_counter = 30000000
+        id_counter = 0
 
         def get_xmp_value(root, name):
             for elem in root.iter():
@@ -120,20 +112,14 @@ class RealityScanToSfMData(desc.Node):
             return None
 
         def rc_rotation_to_av(rotation):
-            """Convert RealityScan rotation (world2cam, row-major) to AliceVision rotation (cam2world, column-major)."""
-            rc_matrix = [float(x) for x in rotation.split()]
-            av_matrix = [
-                 rc_matrix[0],  rc_matrix[3],  rc_matrix[6],
-                -rc_matrix[1], -rc_matrix[4], -rc_matrix[7],
-                -rc_matrix[2], -rc_matrix[5], -rc_matrix[8],
-            ]
-            return [str(x) for x in av_matrix]
+            """Convert RealityScan rotation (world2cam, row-major) to AliceVision rotation."""
+            rc_matrix = np.array([float(x) for x in rotation.split()]).reshape(3, 3)
+            return rc_matrix
 
         def rc_position_to_av(position):
             """Convert RealityScan position (world coordinates) to AliceVision position (camera center in world coordinates)."""
             pos = [float(x) for x in position.split()]
-            pos = [pos[0], -pos[1], -pos[2]]
-            return [str(x) for x in pos]
+            return np.array([pos[0], pos[1], pos[2]])
 
 
         valid_extensions = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.exr')
@@ -183,68 +169,44 @@ class RealityScanToSfMData(desc.Node):
             px = ppu * max_dim
             py = ppv * max_dim
 
-            intrinsic_key = f"{width}_{height}_{focal_35}"
-            if intrinsic_key not in intrinsics_map:
-                intrinsic_id = str(intrinsic_id_counter)
-                intrinsics_map[intrinsic_key] = intrinsic_id
-                intrinsic_id_counter += 1
+            # RealityScan coefficients: k1 k2 k3 k4 t1 t2
+            disto_model = get_xmp_value(root, "DistortionModel")
+            disto_str = get_xmp_value(root, "DistortionCoeficients")
+            coeffs = [float(x) for x in disto_str.split()] if disto_str else [0.0] * 6
+            if disto_model and not disto_model.startswith("brown"):
+                logging.warning(f"Unsupported distortion model '{disto_model}' for {img_path}, distortion ignored")
+                coeffs = [0.0] * 6
+            elif coeffs[3] != 0.0:
+                logging.warning(f"k4 coefficient not supported by AliceVision Brown model, ignored for {img_path}")
+            k1, k2, k3, _, t1, t2 = coeffs
 
-                sfm_data["intrinsics"].append({
-                    "intrinsicId": intrinsic_id,
-                    "width": str(width),
-                    "height": str(height),
-                    "sensorWidth": str(node.sensorWidth.value),
-                    "sensorHeight": str(node.sensorHeight.value),
-                    "serialNumber": node.serialNumber.value,
-                    "type": "radial3",
-                    "initializationMode": "calibrated",
-                    "initialFocalLength": str(focal_mm),
-                    "focalLength": str(focal_mm),
-                    "pixelRatio": "1.0",
-                    "pixelRatioInitial": "1.0",
-                    "pixelRatioLocked": "true",
-                    "principalPoint": [str(px), str(py)],
-                    "distortionParams": ["0.0", "0.0", "0.0"],
-                    "locked": "false"
-                })
-            else:
-                intrinsic_id = intrinsics_map[intrinsic_key]
+            intrinsic_id = id_counter
+            v_id = id_counter
+            p_id = id_counter
+            id_counter += 1
 
-            v_id = str(view_id_counter)
-            p_id = str(pose_id_counter)
-            view_id_counter += 1
-            pose_id_counter += 1
+            intrinsic = camera.createPinhole(camera.DISTORTION_BROWN, camera.UNDISTORTION_NONE,
+                                             width, height, 1.0, 1.0, 0.0, 0.0)
+            intrinsic.setDistortionParams([k1, k2, k3, t1, t2])
 
-            sfm_data["views"].append({
-                "viewId": v_id,
-                "poseId": p_id,
-                "intrinsicId": intrinsic_id,
-                "reconstructionId": "0",
-                "path": img_path,
-                "width": str(width),
-                "height": str(height),
-                "metadata": {
-                    "Make": node.cameraMake.value,
-                    "Model": node.cameraModel.value
-                }
-            })
+            intrinsic.setSensorWidth(node.sensorWidth.value)
+            intrinsic.setSensorHeight(node.sensorHeight.value)
+            intrinsic.setSerialNumber(node.serialNumber.value)
+            intrinsic.setInitializationMode(camera.EInitMode_CALIBRATED)
+            intrinsic.setFocalLength(focal_mm, 1.0)
+            intrinsic.setInitialFocalLength(focal_mm, 1.0)
+            intrinsic.setOffset(np.array([px, py]))
+            data.getIntrinsics()[intrinsic_id] = intrinsic
 
-            rot = rc_rotation_to_av(rot_str)
-            pos = rc_position_to_av(pos_str)
+            metadata = {"Make": node.cameraMake.value, "Model": node.cameraModel.value}
+            data.getViews()[v_id] = sfmData.View(img_path, v_id, intrinsic_id, p_id, width, height,
+                                                 sfmData.UndefinedIndexT, sfmData.UndefinedIndexT, metadata)
 
-            sfm_data["poses"].append({
-                "poseId": p_id,
-                "pose": {
-                    "transform": {
-                        "rotation": rot,
-                        "center": pos
-                    },
-                    "locked": "false"
-                }
-            })
+            pose = geometry.Pose3(rc_rotation_to_av(rot_str), rc_position_to_av(pos_str))
+            data.getPoses()[p_id] = sfmData.CameraPose(pose, False)
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
-        with open(output_path, "w") as f:
-            json.dump(sfm_data, f, indent=4)
+        if not sfmDataIO.save(data, output_path, sfmDataIO.ALL):
+            raise RuntimeError(f"Unable to save SfMData to {output_path}")
 
-        logging.info(f"SfMData generated successfully: {len(sfm_data['views'])} views processed.")
+        logging.info(f"SfMData generated successfully: {len(data.getViews())} views processed.")
