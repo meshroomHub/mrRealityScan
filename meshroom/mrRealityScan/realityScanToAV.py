@@ -4,7 +4,7 @@ import os
 import json
 
 from meshroom.core import desc
-
+from meshroom.core.utils import VERBOSE_LEVEL
 
 class RealityScanToSfMData(desc.Node):
     """Convert RealityScan XMP camera files to AliceVision SfMData.
@@ -14,7 +14,7 @@ class RealityScanToSfMData(desc.Node):
     that can be used directly in a Meshroom pipeline.
     """
 
-    category = "SfmIO"
+    category = "Utils"
 
     inputs = [
         desc.File(
@@ -61,6 +61,13 @@ class RealityScanToSfMData(desc.Node):
             description="Camera serial number used to group views into intrinsic groups.",
             value="0",
         ),
+        desc.ChoiceParam(
+            name="verboseLevel",
+            label="Verbose Level",
+            description="Verbosity level (fatal, error, warning, info, debug, trace).",
+            values=VERBOSE_LEVEL,
+            value="info",
+        )
     ]
 
     outputs = [
@@ -75,6 +82,10 @@ class RealityScanToSfMData(desc.Node):
     def process(self, node):
         import xml.etree.ElementTree as ET
         from PIL import Image
+        import logging
+
+        logging.getLogger().setLevel(node.verboseLevel.value.upper())
+
         
         xmp_folder = node.xmpFolder.value
         images_folder = node.imagesFolder.value
@@ -141,14 +152,14 @@ class RealityScanToSfMData(desc.Node):
             elif os.path.exists(xmp_path_2):
                 xmp_path = xmp_path_2
             else:
-                print(f"[Warning] XMP file not found (neither '{base_name}.xmp' nor '{img_name}.xmp')")
+                logging.warning(f"XMP file not found (neither '{base_name}.xmp' nor '{img_name}.xmp')")
                 continue
 
             try:
                 with Image.open(img_path) as img:
                     width, height = img.size
             except Exception as e:
-                print(f"[Error] Unable to read image {img_path}: {e}")
+                logging.error(f"Unable to read image {img_path}: {e}")
                 continue
 
             max_dim = max(width, height)
@@ -165,7 +176,7 @@ class RealityScanToSfMData(desc.Node):
             pos_str = get_xmp_value(root, "Position")
 
             if not rot_str or not pos_str:
-                print(f"[Warning] XMP skipped (missing Rotation or Position) for {img_path}")
+                logging.warning(f"XMP skipped (missing Rotation or Position) for {img_path}")
                 continue
 
             focal_mm = (focal_35 / 36.0) * sensor_width
@@ -236,4 +247,4 @@ class RealityScanToSfMData(desc.Node):
         with open(output_path, "w") as f:
             json.dump(sfm_data, f, indent=4)
 
-        print(f"SfMData generated successfully: {len(sfm_data['views'])} views processed.")
+        logging.info(f"SfMData generated successfully: {len(sfm_data['views'])} views processed.")
