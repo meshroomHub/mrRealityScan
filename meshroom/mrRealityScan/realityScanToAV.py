@@ -73,8 +73,8 @@ class RealityScanToSfMData(desc.Node):
         desc.File(
             name="output",
             label="SfMData",
-            description="Path to the output AliceVision SfMData JSON file.",
-            value="{nodeCacheFolder}/sfmData.json",
+            description="Path to the output AliceVision SfMData file.",
+            value="{nodeCacheFolder}/sfmData.usda",
         ),
     ]
 
