@@ -111,15 +111,20 @@ class RealityScanToSfMData(desc.Node):
                         return val
             return None
 
+        # RealityScan world is Z-up, AliceVision is Y-down, plus 90° around Y: (x, y, z) -> (y, -z, -x)
+        world_rc_to_av = np.array([[0.0, 1.0, 0.0],
+                                   [0.0, 0.0, -1.0],
+                                   [-1.0, 0.0, 0.0]])
+
         def rc_rotation_to_av(rotation):
-            """Convert RealityScan rotation (world2cam, row-major) to AliceVision rotation."""
+            """Convert RealityScan rotation (world2cam, row-major, Z-up world) to AliceVision rotation (Y-up world)."""
             rc_matrix = np.array([float(x) for x in rotation.split()]).reshape(3, 3)
-            return rc_matrix
+            return rc_matrix @ world_rc_to_av.T
 
         def rc_position_to_av(position):
-            """Convert RealityScan position (world coordinates) to AliceVision position (camera center in world coordinates)."""
-            pos = [float(x) for x in position.split()]
-            return np.array([pos[0], pos[1], pos[2]])
+            """Convert RealityScan position (Z-up world) to AliceVision camera center (Y-up world)."""
+            pos = np.array([float(x) for x in position.split()])
+            return world_rc_to_av @ pos
 
 
         valid_extensions = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.exr')
