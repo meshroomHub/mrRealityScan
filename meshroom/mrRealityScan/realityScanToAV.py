@@ -28,6 +28,14 @@ class RealityScanToSfMData(desc.Node):
             description="Folder containing the source images referenced by the XMP files.",
             value="",
         ),
+        desc.BoolParam(
+            name="matchByFrameNumber",
+            label="Match By Frame Number",
+            description="Match XMP files and images using the last number in their filenames instead of their names.\n"
+                        "Images without XMP are skipped. The node fails if an XMP has no matching image\n"
+                        "or if a frame number is shared by several images or several XMP files.",
+            value=False,
+        ),
         desc.FloatParam(
             name="sensorWidth",
             label="Sensor Width (mm)",
@@ -79,11 +87,11 @@ class RealityScanToSfMData(desc.Node):
     ]
 
     def process(self, node):
+        import re
         import xml.etree.ElementTree as ET
-        from PIL import Image
         import logging
         import numpy as np
-        from pyalicevision import sfmData, sfmDataIO, camera, geometry
+        from pyalicevision import sfmData, sfmDataIO, camera, geometry, image as avimage
 
         logging.getLogger().setLevel(node.verboseLevel.value.upper())
 
@@ -128,27 +136,65 @@ class RealityScanToSfMData(desc.Node):
 
 
         valid_extensions = ('.jpg', '.jpeg', '.png', '.tif', '.tiff', '.exr')
-        for img_name in sorted(os.listdir(images_folder)):
-            if not img_name.lower().endswith(valid_extensions):
-                continue
+        img_names = sorted(f for f in os.listdir(images_folder) if f.lower().endswith(valid_extensions))
 
-            img_path = os.path.join(images_folder, img_name)
-            base_name = os.path.splitext(img_name)[0]
+        def frame_number(filename):
+            """Return the last number found in the filename (extensions excluded), or None."""
+            stem = filename
+            if stem.lower().endswith(".xmp"):
+                stem = stem[:-len(".xmp")]
+            if stem.lower().endswith(valid_extensions):
+                stem = os.path.splitext(stem)[0]
+            numbers = re.findall(r"\d+", stem)
+            return int(numbers[-1]) if numbers else None
 
-            xmp_path_1 = os.path.join(xmp_folder, img_name + ".xmp")  # e.g., image.jpg.xmp
-            xmp_path_2 = os.path.join(xmp_folder, base_name + ".xmp")  # e.g., image.xmp
+        def index_by_frame(names, kind):
+            """Map frame number -> filename, failing on missing or duplicated frame numbers."""
+            frames = {}
+            for name in names:
+                frame = frame_number(name)
+                if frame is None:
+                    raise ValueError(f"No frame number found in {kind} filename '{name}'.")
+                if frame in frames:
+                    raise ValueError(f"Frame number {frame} is shared by {kind} files "
+                                     f"'{frames[frame]}' and '{name}'.")
+                frames[frame] = name
+            return frames
 
-            if os.path.exists(xmp_path_1):
-                xmp_path = xmp_path_1
-            elif os.path.exists(xmp_path_2):
-                xmp_path = xmp_path_2
-            else:
-                logging.warning(f"XMP file not found (neither '{base_name}.xmp' nor '{img_name}.xmp')")
-                continue
+        pairs = []  # (image path, xmp path)
+        images_without_xmp = 0
+        if node.matchByFrameNumber.value:
+            xmp_names = sorted(f for f in os.listdir(xmp_folder) if f.lower().endswith(".xmp"))
+            img_frames = index_by_frame(img_names, "image")
+            xmp_frames = index_by_frame(xmp_names, "XMP")
+            missing_img = sorted(set(xmp_frames) - set(img_frames))
+            if missing_img:
+                raise ValueError(f"XMP files without a matching image frame number: {missing_img}.")
+            for frame in sorted(img_frames):
+                if frame not in xmp_frames:
+                    logging.debug(f"No XMP file for frame {frame} ('{img_frames[frame]}')")
+                    images_without_xmp += 1
+                    continue
+                pairs.append((os.path.join(images_folder, img_frames[frame]),
+                              os.path.join(xmp_folder, xmp_frames[frame])))
+        else:
+            for img_name in img_names:
+                base_name = os.path.splitext(img_name)[0]
+                xmp_path_1 = os.path.join(xmp_folder, img_name + ".xmp")  # e.g., image.jpg.xmp
+                xmp_path_2 = os.path.join(xmp_folder, base_name + ".xmp")  # e.g., image.xmp
+                if os.path.exists(xmp_path_1):
+                    pairs.append((os.path.join(images_folder, img_name), xmp_path_1))
+                elif os.path.exists(xmp_path_2):
+                    pairs.append((os.path.join(images_folder, img_name), xmp_path_2))
+                else:
+                    logging.debug(f"XMP file not found (neither '{base_name}.xmp' nor '{img_name}.xmp')")
+                    images_without_xmp += 1
+
+        for img_path, xmp_path in pairs:
+            logging.debug(f"Matched image '{img_path}' with XMP '{xmp_path}'")
 
             try:
-                with Image.open(img_path) as img:
-                    width, height = img.size
+                width, height = avimage.readImageSize(img_path)
             except Exception as e:
                 logging.error(f"Unable to read image {img_path}: {e}")
                 continue
@@ -215,3 +261,5 @@ class RealityScanToSfMData(desc.Node):
             raise RuntimeError(f"Unable to save SfMData to {output_path}")
 
         logging.info(f"SfMData generated successfully: {len(data.getViews())} views processed.")
+        if images_without_xmp:
+            logging.warning(f"{images_without_xmp} image(s) without XMP file were skipped.")
